@@ -7,7 +7,9 @@ Modern Streamlit UI (dark glassmorphism)
 import base64
 import html
 import json
+import re
 import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
@@ -220,6 +222,371 @@ def convert_proxies(
 
 
 # ============================================================
+# Subscription Parsing (Share Link → Clash Proxy)
+# ============================================================
+
+def _b64_decode_flex(s: str) -> str:
+    """Decode base64 (auto-padding; tries standard then urlsafe)."""
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return ""
+    s += "=" * (-len(s) % 4)
+    for fn in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            return fn(s.encode("ascii")).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+    return ""
+
+
+def _b64_decode_urlsafe(s: str) -> str:
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return ""
+    s += "=" * (-len(s) % 4)
+    try:
+        return base64.urlsafe_b64decode(s).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _split_userinfo(netloc: str) -> tuple:
+    if "@" in netloc:
+        userinfo, _, hostport = netloc.rpartition("@")
+        return userinfo, hostport
+    return "", netloc
+
+
+def _split_host_port(hostport: str) -> tuple:
+    hostport = hostport.strip()
+    if not hostport:
+        return "", 0
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        host = hostport[: end + 1]
+        rest = hostport[end + 1 :]
+        return host, int(rest.strip(":")) if rest.strip(":") else 0
+    if ":" in hostport:
+        host, _, port = hostport.rpartition(":")
+        return host, int(port) if port.isdigit() else 0
+    return hostport, 0
+
+
+def _clean_proxy(obj):
+    if not isinstance(obj, dict):
+        return obj
+    out = {}
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            v = _clean_proxy(v)
+            if not v:
+                continue
+        if v is None or v == "":
+            continue
+        out[k] = v
+    return out
+
+
+def parse_vless_link(link: str) -> Optional[Dict[str, Any]]:
+    u = urllib.parse.urlsplit(link)
+    if u.scheme.lower() != "vless":
+        return None
+    uuid, hostport = _split_userinfo(u.netloc)
+    host, port = _split_host_port(hostport)
+    if not uuid or not host or not port:
+        return None
+    params = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    proxy = {
+        "name": urllib.parse.unquote(u.fragment) or "VLESS",
+        "type": "vless", "server": host, "port": port, "uuid": uuid, "udp": True,
+        "network": params.get("type", "tcp"),
+        "flow": params.get("flow", ""),
+        "client-fingerprint": params.get("fp", ""),
+    }
+    security = params.get("security", "")
+    if security == "reality":
+        proxy["tls"] = True
+        proxy["servername"] = params.get("sni", "")
+        proxy["reality-opts"] = {
+            "public-key": params.get("pbk", ""),
+            "short-id": params.get("sid", ""),
+        }
+        if params.get("spx"):
+            proxy["reality-opts"]["spider-x"] = params["spx"]
+    elif security == "tls":
+        proxy["tls"] = True
+        proxy["servername"] = params.get("sni", "")
+    if params.get("allowInsecure") == "1":
+        proxy["skip-cert-verify"] = True
+    if proxy["network"] == "ws":
+        proxy["ws-opts"] = {"path": params.get("path", "/")}
+        if params.get("host"):
+            proxy["ws-opts"]["headers"] = {"Host": params["host"]}
+    elif proxy["network"] == "grpc":
+        proxy["grpc-opts"] = {"grpc-service-name": params.get("serviceName", "")}
+    return _clean_proxy(proxy)
+
+
+def parse_trojan_link(link: str) -> Optional[Dict[str, Any]]:
+    u = urllib.parse.urlsplit(link)
+    if u.scheme.lower() != "trojan":
+        return None
+    password, hostport = _split_userinfo(u.netloc)
+    host, port = _split_host_port(hostport)
+    if not password or not host or not port:
+        return None
+    params = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    proxy = {
+        "name": urllib.parse.unquote(u.fragment) or "Trojan",
+        "type": "trojan", "server": host, "port": port, "password": password, "udp": True,
+        "sni": params.get("sni", ""),
+        "network": params.get("type", "tcp"),
+    }
+    if params.get("allowInsecure") == "1":
+        proxy["skip-cert-verify"] = True
+    if proxy["network"] == "ws":
+        proxy["ws-opts"] = {"path": params.get("path", "/")}
+        if params.get("host"):
+            proxy["ws-opts"]["headers"] = {"Host": params["host"]}
+    elif proxy["network"] == "grpc":
+        proxy["grpc-opts"] = {"grpc-service-name": params.get("serviceName", "")}
+    return _clean_proxy(proxy)
+
+
+def parse_vmess_link(link: str) -> Optional[Dict[str, Any]]:
+    if not link.lower().startswith("vmess://"):
+        return None
+    decoded = _b64_decode_flex(link[len("vmess://"):])
+    if not decoded:
+        return None
+    try:
+        cfg = json.loads(decoded)
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    try:
+        port = int(cfg.get("port", 0))
+    except (TypeError, ValueError):
+        return None
+    server = cfg.get("add", "")
+    if not server or not port:
+        return None
+    net = cfg.get("net", "tcp").lower()
+    proxy = {
+        "name": cfg.get("ps") or "VMess",
+        "type": "vmess", "server": server, "port": port,
+        "uuid": cfg.get("id", ""), "alterId": int(cfg.get("aid", 0) or 0),
+        "cipher": cfg.get("scy", "auto"), "udp": True,
+    }
+    if net in ("ws", "grpc", "tcp", "http", "h2"):
+        proxy["network"] = net
+    if cfg.get("tls") == "tls":
+        proxy["tls"] = True
+        proxy["servername"] = cfg.get("sni", "") or cfg.get("host", "")
+    if net == "ws":
+        proxy["ws-opts"] = {"path": cfg.get("path", "/")}
+        if cfg.get("host"):
+            proxy["ws-opts"]["headers"] = {"Host": cfg["host"]}
+    if cfg.get("fp"):
+        proxy["client-fingerprint"] = cfg["fp"]
+    return _clean_proxy(proxy)
+
+
+def parse_ss_link(link: str) -> Optional[Dict[str, Any]]:
+    if not link.lower().startswith("ss://"):
+        return None
+    payload = link[len("ss://"):]
+    name = "SS"
+    if "#" in payload:
+        payload, _, _name = payload.rpartition("#")
+        name = urllib.parse.unquote(_name) or "SS"
+    if "@" in payload:
+        userinfo, _, hostport = payload.rpartition("@")
+        hostport = hostport.split("/")[0]
+        host, port = _split_host_port(hostport)
+        if ":" in userinfo:
+            method, _, password = userinfo.partition(":")
+        else:
+            cred = _b64_decode_urlsafe(userinfo)
+            if ":" in cred:
+                method, _, password = cred.partition(":")
+            else:
+                method, password = cred, ""
+    else:
+        decoded = _b64_decode_urlsafe(payload)
+        if "@" not in decoded:
+            return None
+        cred, _, hostport = decoded.rpartition("@")
+        if ":" not in cred:
+            return None
+        method, _, password = cred.partition(":")
+        host, port = _split_host_port(hostport)
+    if not method or not host:
+        return None
+    return _clean_proxy({
+        "name": name, "type": "ss", "server": host, "port": port,
+        "cipher": method, "password": password, "udp": True,
+    })
+
+
+def parse_ssr_link(link: str) -> Optional[Dict[str, Any]]:
+    if not link.lower().startswith("ssr://"):
+        return None
+    decoded = _b64_decode_urlsafe(link[len("ssr://"):])
+    if not decoded:
+        return None
+    main, _, query = decoded.partition("/?")
+    parts = main.split(":")
+    if len(parts) < 6:
+        return None
+    server, port_s, protocol, method, obfs, pwd_enc = parts[:6]
+    try:
+        port = int(port_s)
+    except ValueError:
+        return None
+    params = dict(urllib.parse.parse_qsl(query)) if query else {}
+    proxy = {
+        "name": _b64_decode_urlsafe(params.get("remarks", "")) or "SSR",
+        "type": "ssr", "server": server, "port": port,
+        "cipher": method, "password": _b64_decode_urlsafe(pwd_enc),
+        "protocol": protocol, "obfs": obfs, "udp": True,
+    }
+    obfs_param = _b64_decode_urlsafe(params.get("obfsparam", ""))
+    proto_param = _b64_decode_urlsafe(params.get("protoparam", ""))
+    if obfs_param:
+        proxy["obfs-param"] = obfs_param
+    if proto_param:
+        proxy["protocol-param"] = proto_param
+    return _clean_proxy(proxy)
+
+
+def parse_anytls_link(link: str) -> Optional[Dict[str, Any]]:
+    u = urllib.parse.urlsplit(link)
+    if u.scheme.lower() != "anytls":
+        return None
+    password, hostport = _split_userinfo(u.netloc)
+    host, port = _split_host_port(hostport)
+    if not password or not host:
+        return None
+    params = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    proxy = {
+        "name": urllib.parse.unquote(u.fragment) or "anytls",
+        "type": "anytls", "server": host, "port": port or 443,
+        "password": password, "udp": True,
+    }
+    if params.get("sni"):
+        proxy["sni"] = params["sni"]
+    if params.get("insecure") == "1":
+        proxy["skip-cert-verify"] = True
+    return _clean_proxy(proxy)
+
+
+def parse_hysteria2_link(link: str) -> Optional[Dict[str, Any]]:
+    u = urllib.parse.urlsplit(link)
+    if u.scheme.lower() not in ("hysteria2", "hy2"):
+        return None
+    password, hostport = _split_userinfo(u.netloc)
+    host, port = _split_host_port(hostport)
+    if not host:
+        return None
+    params = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    auth = password or params.get("auth", "")
+    proxy = {
+        "name": urllib.parse.unquote(u.fragment) or "hysteria2",
+        "type": "hysteria2", "server": host, "port": port or 443,
+        "password": auth, "udp": True,
+    }
+    if params.get("sni"):
+        proxy["sni"] = params["sni"]
+    if params.get("insecure") == "1":
+        proxy["skip-cert-verify"] = True
+    return _clean_proxy(proxy)
+
+
+LINK_PARSERS = {
+    "vless": parse_vless_link,
+    "vmess": parse_vmess_link,
+    "trojan": parse_trojan_link,
+    "ss": parse_ss_link,
+    "ssr": parse_ssr_link,
+    "anytls": parse_anytls_link,
+    "hysteria2": parse_hysteria2_link,
+    "hy2": parse_hysteria2_link,
+}
+
+
+def parse_share_links(text: str):
+    proxies: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        scheme = line.split("://", 1)[0].lower() if "://" in line else ""
+        parser = LINK_PARSERS.get(scheme)
+        if not parser:
+            errors.append(f"Unsupported link: {line[:60]}")
+            continue
+        proxy = parser(line)
+        if proxy:
+            proxies.append(proxy)
+        else:
+            errors.append(f"Could not parse: {line[:60]}")
+    return proxies, errors
+
+
+def decode_subscription(content: str) -> str:
+    content = content.strip()
+    for _ in range(3):
+        if "://" in content or re.search(r"^\s*(proxies|proxy-groups)\s*:", content, re.MULTILINE):
+            break
+        decoded = _b64_decode_flex(content)
+        if not decoded or decoded.strip() == content:
+            break
+        content = decoded.strip()
+    return content
+
+
+def parse_subscription(content: str):
+    content = content.strip()
+    if not content:
+        raise ValueError("Subscription content is empty.")
+    content = decode_subscription(content)
+    if re.search(r"^\s*(proxies|proxy-groups)\s*:", content, re.MULTILINE):
+        data = yaml.safe_load(content)
+        if isinstance(data, dict):
+            return [_clean_proxy(p) for p in (data.get("proxies") or []) if isinstance(p, dict)], []
+        raise ValueError("Subscription YAML has an invalid structure.")
+    proxies, errors = parse_share_links(content)
+    if not proxies and not errors:
+        raise ValueError("No recognizable proxy data was found in the subscription.")
+    return [_clean_proxy(p) for p in proxies], errors
+
+
+def build_clash_yaml(proxies: List[Dict[str, Any]]) -> str:
+    return yaml.safe_dump({"proxies": proxies}, allow_unicode=True, sort_keys=False)
+
+
+def fetch_subscription_url(url: str) -> str:
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise ValueError("Subscription URL must start with http:// or https://")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "clash-verge/v1.5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+    except Exception as e:
+        raise ValueError(f"Failed to fetch subscription: {e}")
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+# ============================================================
 # Streamlit Setup + Theme
 # ============================================================
 
@@ -425,6 +792,9 @@ div[data-testid="stAlert"] {
 .badge-anytls { background: linear-gradient(135deg, #10b981, #059669); }
 .badge-trojan { background: linear-gradient(135deg, #f59e0b, #d97706); }
 .badge-vmess  { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
+.badge-ss     { background: linear-gradient(135deg, #06b6d4, #0891b2); }
+.badge-ssr    { background: linear-gradient(135deg, #6366f1, #4f46e5); }
+.badge-hysteria2 { background: linear-gradient(135deg, #ec4899, #db2777); }
 
 .count-pill {
     display: inline-flex; align-items: center;
@@ -525,7 +895,10 @@ with st.sidebar:
         '<span class="chip">VLESS · Reality</span>'
         '<span class="chip">anytls</span>'
         '<span class="chip">Trojan</span>'
-        '<span class="chip">VMess</span>',
+        '<span class="chip">VMess</span>'
+        '<span class="chip">SS</span>'
+        '<span class="chip">SSR</span>'
+        '<span class="chip">Hysteria2</span>',
         unsafe_allow_html=True,
     )
     st.caption("Reality / Vision · WebSocket · gRPC")
@@ -552,9 +925,46 @@ st.markdown("""
 # Input
 # ============================================================
 
-tab1, tab2 = st.tabs(["📁 Upload YAML File", "📝 Paste YAML Content"])
+sub_tab, tab1, tab2 = st.tabs([
+    "� Import Subscription",
+    "� Upload YAML File",
+    "📝 Paste YAML Content",
+])
 
+subscription_content = None
 yaml_content = None
+
+with sub_tab:
+    st.caption(
+        "Enter a subscription URL or paste subscription content "
+        "(Base64 blob / share links / Clash YAML). It will be converted into Clash YAML."
+    )
+    sub_url = st.text_input(
+        "Subscription URL",
+        placeholder="https://example.com/sub?token=xxxx",
+        label_visibility="collapsed",
+    )
+    if st.button("⬇️ Fetch subscription", use_container_width=True):
+        if sub_url.strip():
+            with st.spinner("Fetching subscription..."):
+                try:
+                    subscription_content = fetch_subscription_url(sub_url.strip())
+                    st.success("Subscription fetched successfully.", icon="✅")
+                except ValueError as e:
+                    st.error(str(e), icon="🚫")
+        else:
+            st.warning("Please enter a subscription URL.", icon="⚠️")
+
+    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+    st.caption("OR PASTE SUBSCRIPTION CONTENT")
+    sub_pasted = st.text_area(
+        "Subscription content",
+        height=180,
+        label_visibility="collapsed",
+        placeholder="vless://...\nvmess://...\n( or a Base64 blob )",
+    )
+    if sub_pasted.strip():
+        subscription_content = sub_pasted
 
 with tab1:
     uploaded_file = st.file_uploader(
@@ -580,7 +990,93 @@ with tab2:
 # Processing & Output
 # ============================================================
 
-if yaml_content:
+if subscription_content:
+    try:
+        proxies, parse_errors = parse_subscription(subscription_content)
+        if not proxies:
+            st.error("No valid proxies were found in the subscription.", icon="🚫")
+            if parse_errors:
+                with st.expander("🔍 Details"):
+                    for e in parse_errors:
+                        st.write(f"- {e}")
+            st.stop()
+
+        clash_yaml = build_clash_yaml(proxies)
+
+        # ---- Stat cards ----
+        type_count: Dict[str, int] = {}
+        for p in proxies:
+            t = str(p.get("type", "unknown")).upper()
+            type_count[t] = type_count.get(t, 0) + 1
+
+        cards = [
+            ("🔗", "Total Nodes", len(proxies), "#6366f1", "#8b5cf6"),
+            ("⚡", "VLESS", type_count.get("VLESS", 0), "#3b82f6", "#60a5fa"),
+            ("🛡️", "Trojan / VMess",
+             type_count.get("TROJAN", 0) + type_count.get("VMESS", 0),
+             "#f59e0b", "#f97316"),
+            ("🧩", "SS / SSR / Hysteria2",
+             type_count.get("SS", 0) + type_count.get("SSR", 0) + type_count.get("HYSTERIA2", 0),
+             "#10b981", "#34d399"),
+        ]
+        cols = st.columns(4)
+        for col, (icon, label, value, c1, c2) in zip(cols, cards):
+            col.markdown(
+                f"""<div class="stat-card" style="--c1:{c1};--c2:{c2}">
+                        <div class="stat-value">{value}</div>
+                        <div class="stat-label">{icon} &nbsp;{label}</div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+        head_col, btn_col = st.columns([0.72, 0.28])
+        head_col.markdown(
+            f'### 📄 Clash YAML <span class="count-pill">{len(proxies)}</span>',
+            unsafe_allow_html=True,
+        )
+        btn_col.download_button(
+            "⬇️  Download config.yaml", clash_yaml,
+            "config.yaml", "text/yaml", use_container_width=True,
+        )
+        st.code(clash_yaml, language="yaml")
+        st.info(
+            "Import this YAML into Clash Meta / Mihomo, or convert it back to share links "
+            "using the other tabs.", icon="💡",
+        )
+
+        if parse_errors:
+            st.warning(f"{len(parse_errors)} link(s) could not be parsed.", icon="⚠️")
+            with st.expander("🔍 Unparsed / unsupported links"):
+                for e in parse_errors:
+                    st.write(f"- {e}")
+
+        with st.expander(f"🔍 Parsed nodes ({len(proxies)})", expanded=len(proxies) <= 6):
+            for i, p in enumerate(proxies, 1):
+                ptype = str(p.get("type", "unknown")).lower()
+                badge = (
+                    f'<span class="badge badge-{ptype}">{str(p.get("type", "unknown")).upper()}</span>'
+                    if show_type_badge else ""
+                )
+                name = (
+                    f'<span class="node-name">{html.escape(str(p.get("name", "Unknown")))}</span>'
+                    if show_names else ""
+                )
+                st.markdown(
+                    f'<div class="node-card"><div class="node-head">'
+                    f'<span class="node-idx">#{i:02d}</span>{badge}{name}'
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+                st.code(yaml.safe_dump([p], allow_unicode=True, sort_keys=False), language="yaml")
+
+    except (ValueError, yaml.YAMLError) as e:
+        st.error(f"Subscription error: `{e}`")
+    except Exception as e:
+        st.error(f"Unexpected error: `{e}`")
+
+elif yaml_content:
     try:
         data = yaml.safe_load(yaml_content)
         if not isinstance(data, dict):
@@ -685,7 +1181,7 @@ if yaml_content:
 
 else:
     # ---------- Empty state ----------
-    st.info("Upload a Clash YAML file or paste YAML content in a tab above to get started.", icon="✨")
+    st.info("Import a subscription, upload a Clash YAML file, or paste YAML content in a tab above to get started.", icon="✨")
 
     st.markdown("""
     <div class="fade-in">
