@@ -190,11 +190,48 @@ def convert_vmess(proxy: Dict[str, Any]) -> Optional[str]:
     return f"vmess://{encoded}"
 
 
+def convert_hysteria2(proxy: Dict[str, Any]) -> Optional[str]:
+    password = proxy.get("password")
+    server = proxy.get("server")
+    port = proxy.get("port", 443)
+    name = proxy.get("name", "Hysteria2")
+
+    if not password or not server:
+        return None
+
+    # userpass auth: auth (username) + auth-str (password)
+    auth = str(password)
+    if proxy.get("auth") and proxy.get("auth-str"):
+        auth = f"{proxy['auth']}:{proxy['auth-str']}"
+
+    params = {}
+    if proxy.get("sni"):
+        params["sni"] = proxy["sni"]
+    if proxy.get("skip-cert-verify"):
+        params["insecure"] = "1"
+    if proxy.get("obfs"):
+        params["obfs"] = proxy["obfs"]
+    if proxy.get("obfs-password"):
+        params["obfs-password"] = proxy["obfs-password"]
+    if proxy.get("fingerprint"):
+        params["pinSHA256"] = proxy["fingerprint"]
+
+    query = build_query(params)
+    fragment = encode_fragment(name)
+
+    link = f"hysteria2://{urllib.parse.quote(auth, safe=':')}@{server}:{port}"
+    if query:
+        link += f"?{query}"
+    link += f"#{fragment}"
+    return link
+
+
 CONVERTERS = {
     "vless": convert_vless,
     "anytls": convert_anytls,
     "trojan": convert_trojan,
     "vmess": convert_vmess,
+    "hysteria2": convert_hysteria2,
 }
 
 
@@ -486,21 +523,38 @@ def parse_hysteria2_link(link: str) -> Optional[Dict[str, Any]]:
     u = urllib.parse.urlsplit(link)
     if u.scheme.lower() not in ("hysteria2", "hy2"):
         return None
-    password, hostport = _split_userinfo(u.netloc)
+    auth_raw, hostport = _split_userinfo(u.netloc)
     host, port = _split_host_port(hostport)
     if not host:
         return None
     params = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
-    auth = password or params.get("auth", "")
+    auth_raw = urllib.parse.unquote(auth_raw)
+
     proxy = {
         "name": urllib.parse.unquote(u.fragment) or "hysteria2",
         "type": "hysteria2", "server": host, "port": port or 443,
-        "password": auth, "udp": True,
+        "udp": True,
     }
+    # userpass auth is formatted as "username:password"
+    if auth_raw and ":" in auth_raw:
+        user, _, pwd = auth_raw.partition(":")
+        proxy["auth"] = user
+        proxy["auth-str"] = pwd
+    elif auth_raw:
+        proxy["password"] = auth_raw
+    elif params.get("auth"):
+        proxy["password"] = params["auth"]
+
     if params.get("sni"):
         proxy["sni"] = params["sni"]
     if params.get("insecure") == "1":
         proxy["skip-cert-verify"] = True
+    if params.get("obfs"):
+        proxy["obfs"] = params["obfs"]
+    if params.get("obfs-password"):
+        proxy["obfs-password"] = params["obfs-password"]
+    if params.get("pinSHA256"):
+        proxy["fingerprint"] = params["pinSHA256"]
     return _clean_proxy(proxy)
 
 
@@ -870,8 +924,8 @@ with st.sidebar:
     st.caption("PROTOCOLS")
     selected_types = st.multiselect(
         "Types to convert",
-        options=["vless", "anytls", "trojan", "vmess"],
-        default=["vless", "anytls", "trojan"],
+        options=["vless", "anytls", "trojan", "vmess", "hysteria2"],
+        default=["vless", "anytls", "trojan", "hysteria2"],
         label_visibility="collapsed",
     )
 
@@ -1109,8 +1163,11 @@ elif yaml_content:
             ("🔒", "Trojan / VMess",
              type_count.get("TROJAN", 0) + type_count.get("VMESS", 0),
              "#f59e0b", "#f97316"),
+            ("🌐", "Hysteria2",
+             type_count.get("HYSTERIA2", 0),
+             "#ec4899", "#f472b6"),
         ]
-        cols = st.columns(4)
+        cols = st.columns(5)
         for col, (icon, label, value, c1, c2) in zip(cols, cards):
             col.markdown(
                 f"""<div class="stat-card" style="--c1:{c1};--c2:{c2}">
